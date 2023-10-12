@@ -14,6 +14,26 @@ import argparse
 import pprint
 from datetime import datetime
 
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def warning(log):
+    print(bcolors.WARNING + log + bcolors.ENDC)
+
+def fail(log):
+    print(bcolors.FAIL + log + bcolors.ENDC)
+
+def bold(log):
+    print(bcolors.BOLD + log + bcolors.ENDC)
+
 HOST = "127.0.0.1"
 
 def send_http_request(request,retry = 0):
@@ -48,10 +68,14 @@ def parser():
     parser.add_argument('--request', help='print request states', action='store_true')
     parser.add_argument('--cut', help='print log', action='store_true')
     parser.add_argument('--interval', help='sample the states by interval (s)', type = int, required = False, default = 0)
+    parser.add_argument('--sub', help='print subscription detail',action='store_true')
+    parser.add_argument('--timespan', help='only process log during the time range ', type = str, required = False, nargs=2, default = ["",""])
     return parser.parse_args()
 
 last = None
 types_ip = {}
+subscribe_map = {}
+subscriber_set = set()
 def sample(time,req_json,req_type,ip):
     global methods_map,types_ip,args
     method = req_json["method"] if "method" in req_json else req_json["command"]
@@ -60,21 +84,40 @@ def sample(time,req_json,req_type,ip):
     types_ip[types_ip_key] = types_ip.get(types_ip_key,0) + 1
 
 def print_and_clear(args):
-    global methods_map,types_ip,network_map
+    global methods_map,types_ip,network_map,subscribe_map,subscriber_set
     if args.ip:
-        print("type_ip:request_count")
+        bold("type_ip:request_count")
         pprint.pprint(types_ip)
     if args.network:
-        print("ws or http new/closed: count")
+        bold("ws or http new/closed: count")
         pprint.pprint(network_map)
     if args.request:
-        print("method: count")
+        bold("method: count")
         pprint.pprint(methods_map)
+    if args.sub:
+        bold("subscribe: count")
+        pprint.pprint(subscribe_map)
+        print("subscriber: count:" + str(len(subscriber_set)))
     methods_map = {}
     types_ip = {}
     network_map = {}
+    subscribe_map = {}
+    subscriber_set = set()
+
+def is_in_timespan(line,args):
+    res = re.search(r'(.*?) \(.+', line)
+    if res:
+        cur_time = datetime.strptime(res.group(1), '%Y-%m-%d %H:%M:%S.%f')
+        if args.timespan[0] != "" and cur_time < datetime.strptime(args.timespan[0], '%Y-%m-%d %H:%M:%S.%f'):
+            return False,True
+        if args.timespan[1] != "" and cur_time > datetime.strptime(args.timespan[1], '%Y-%m-%d %H:%M:%S.%f'):
+            return False,False
+    return True,True
 
 def filter_request(line,args):
+    if 'Request processing duration' in line:
+        #avoid process long request
+        return
     res = re.search(r'(.*) \(.+(http|ws) received request from work queue: ({.*}) ip = (.*)', line)
     if res:
         time = res.group(1)
@@ -84,15 +127,15 @@ def filter_request(line,args):
         try:
             json_obj = json.loads(request_str)
         except:
-            print(number_line, 'ERROR: cannot parse json string :',request_str)
+            fail(number_line+ ' ERROR: cannot parse json string :'+request_str)
             return
         if not "method" in json_obj and req_type == "http":
-            print(number_line, 'ERROR: no method in request :',request_str)
+            fail(number_line+ ' ERROR: no method in request :'+request_str)
             return
         sample(time,json_obj,req_type,ip)
         if "params" in json_obj and (json_obj["params"] == [] or json_obj["params"] == [None] or json_obj["params"] == None):
             json_obj["params"] = [{}]
-            print(number_line, 'amended request: ' + str(json_obj))
+            #print(number_line, 'amended request: ' + str(json_obj))
         if not args.dry:
             send_http_request(json.dumps(json_obj),2)
 
@@ -110,20 +153,40 @@ def filter_network(line):
     
 def check_interval(line,args):
     global last
-    res = re.search(r'(.*) \(.+', line)
+    res = re.search(r'(.*?) \(.+', line)
     if res:
         cur_time = datetime.strptime(res.group(1), '%Y-%m-%d %H:%M:%S.%f')
         if last != None:
             delta = cur_time - last
             if delta.total_seconds() > args.interval:
-                print("From " + str(last) + " to " + str(cur_time) + ":")
+                warning("From " + str(last) + " to " + str(cur_time) + ":")
                 print_and_clear(args)
                 last = cur_time
         else:
             last = cur_time
-        
 
-
+def fileter_sub(line):
+    global subscriber_set,subscribe_map
+    if 'Request processing duration' in line:
+        #avoid process long request
+        return
+    res = re.search(r'(.*) \(.+ws received request from work queue: ({.*}) ip = (.*)', line)
+    if res:
+        try:
+            request_str = res.group(2)
+            ip = res.group(3)
+            json_obj = json.loads(request_str)
+        except:
+            print(number_line, 'ERROR: cannot parse json string :',request_str)
+            return
+        for key in ('command','method'):
+            for ty in ('accounts','books','accounts_proposed'):
+                if key in json_obj and json_obj[key] == "subscribe":
+                    subscriber_set.add(ip)
+                    if ty in json_obj:
+                        subscribe_map[ty] = subscribe_map.get(ty,0) + len(json_obj[ty])
+            
+            
 #methods states
 methods_map = {}
 
@@ -137,7 +200,14 @@ with open(logfile) as f:
     number_line = 0
     for line in f:
         number_line += 1
-        if number_line < start_line or (end_line != -1 and number_line > end_line):
+        if number_line < start_line:
+            continue
+        if (end_line != -1 and number_line > end_line):
+            break
+        within, continuing = is_in_timespan(line,args)
+        if not continuing:
+            break
+        if not within:
             continue
         if args.cut:
             print(line)
@@ -148,7 +218,10 @@ with open(logfile) as f:
             filter_request(line,args)
         if args.network:
             filter_network(line)
+        if args.sub:
+            fileter_sub(line)
             
-print("From " + str(last) + " to end:")
+if last:
+    warning("From " + str(last) + " to end:")
 print_and_clear(args)
 
