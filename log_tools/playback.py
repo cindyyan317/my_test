@@ -13,6 +13,8 @@ import time
 import argparse
 import pprint
 from datetime import datetime
+from websockets.sync.client import connect
+
 
 class bcolors:
     HEADER = '\033[95m'
@@ -36,33 +38,85 @@ def bold(log):
 
 HOST = "127.0.0.1"
 
-def send_http_request(request,retry = 0):
-    while True:
+def send_http_request(line,retry = 0):
+    if 'Request processing duration' in line:
+        #avoid process long request
+        return
+    res = re.search(r'(.*) \(.+http received request from work queue: ({.*}) ip = (.*)', line)
+    if res:
+        time = res.group(1)
+        request_str = res.group(2)
+        ip = res.group(3)
         try:
-            conn = http.client.HTTPConnection(HOST, 51233)
-            conn.request("POST","/", body=request)
-            response = conn.getresponse()
-            response = response.read().decode('utf-8')
-        except OSError:
-            if retry == 0:
-                print("ERROR: connection refused, stop trying")
-                break
-            retry -= 1
-            print("ERROR: connection refused, retrying")
-            time.sleep(30)
-            continue
-        try:
-            json.loads(response)
-            return
+            json_obj = json.loads(request_str)
         except:
-            print("ERROR:",request, response)
+            fail(number_line+ ' ERROR: cannot parse json string :'+request_str)
+            return
+        if not "method" in json_obj and req_type == "http":
+            fail(number_line+ ' ERROR: no method in request :'+request_str)
+            return
+        sample(time,json_obj,req_type,ip)
+        if "params" in json_obj and (json_obj["params"] == [] or json_obj["params"] == [None] or json_obj["params"] == None):
+            json_obj["params"] = [{}]      
+        while True:
+            try:
+                conn = http.client.HTTPConnection(HOST, 51233)
+                conn.request("POST","/", body=json.dumps(json_obj))
+                response = conn.getresponse()
+                response = response.read().decode('utf-8')
+            except OSError:
+                if retry == 0:
+                    print("ERROR: connection refused, stop trying")
+                    break
+                retry -= 1
+                print("ERROR: connection refused, retrying")
+                time.sleep(30)
+                continue
+            try:
+                json.loads(response)
+                return
+            except:
+                print("ERROR:",request, response)
+
+session_map = {}
+# TODO: ports not enough
+def send_ws_request(line):
+    global session_map
+    #step 1: get the session id
+    res = re.search(r'\[(\d+)\] session (created|closed)', line)
+    if res:
+        session_id = res.group(1)
+        if res.group(2) == "created":
+            session_map[session_id] = connect(f"ws://{HOST}:51233")
+            print("created ws session: " + session_id)
+        else:
+            print("closed ws session: " + session_id)
+            if not session_id in session_map:
+                warning("session {} not found".format(session_id))
+            else:
+                session_map[session_id].close()
+                del session_map[session_id]
+        return
+    res = re.search(r'([.+]) ws received request from work queue: ({.*}) ip = (.*)', line)
+    if res:
+        session = res.group(1)
+        request_str = res.group(2)
+        ip = res.group(3) 
+    #step 2: find the session in map
+        if not session in session_map:
+            warning("session {} not found".format(session))
+            session_map[session_id] = connect(f"ws://{HOST}:51233")        
+    #step 3: send the request
+        session_map[session_id].send(request_str)
+
 
 def parser():
     parser = argparse.ArgumentParser(description='log helper')
     parser.add_argument('log_file', help='log file', type = str)
     parser.add_argument('start_line', help='start line', type = int)
     parser.add_argument('end_line', help='end line, -1 means the end of the file', type = int)
-    parser.add_argument('--dry', help='not issue the request', action='store_true')
+    parser.add_argument('--replay_http', help='replay http request', action='store_true')
+    parser.add_argument('--replay_ws', help='replay ws request', action='store_true')
     parser.add_argument('--ip', help='print ip states', action='store_true')
     parser.add_argument('--network', help='print http/ws states', action='store_true')
     parser.add_argument('--request', help='print request states', action='store_true')
@@ -70,6 +124,8 @@ def parser():
     parser.add_argument('--interval', help='sample the states by interval (s)', type = int, required = False, default = 0)
     parser.add_argument('--sub', help='print subscription detail',action='store_true')
     parser.add_argument('--timespan', help='only process log during the time range ', type = str, required = False, nargs=2, default = ["",""])
+    parser.add_argument('--replay_all', help='replay all requests', action='store_true')
+    parser.add_argument('--cmds', help='commands to replay', type = str, required = False, nargs='*')
     return parser.parse_args()
 
 last = None
@@ -105,7 +161,7 @@ def print_and_clear(args):
     subscriber_set = set()
 
 def is_in_timespan(line,args):
-    res = re.search(r'(.*?) \(.+', line)
+    res = re.search(r'(.*?) \[0x.+', line)
     if res:
         cur_time = datetime.strptime(res.group(1), '%Y-%m-%d %H:%M:%S.%f')
         if args.timespan[0] != "" and cur_time < datetime.strptime(args.timespan[0], '%Y-%m-%d %H:%M:%S.%f'):
@@ -118,7 +174,7 @@ def filter_request(line,args):
     if 'Request processing duration' in line:
         #avoid process long request
         return
-    res = re.search(r'(.*) \(.+(http|ws) received request from work queue: ({.*}) ip = (.*)', line)
+    res = re.search(r'(.*) \[0x.+(http|ws) received request from work queue: ({.*}) ip = (.*)', line)
     if res:
         time = res.group(1)
         req_type = res.group(2)
@@ -127,17 +183,12 @@ def filter_request(line,args):
         try:
             json_obj = json.loads(request_str)
         except:
-            fail(number_line+ ' ERROR: cannot parse json string :'+request_str)
+            fail(str(number_line)+ ' ERROR: cannot parse json string :'+request_str)
             return
         if not "method" in json_obj and req_type == "http":
-            fail(number_line+ ' ERROR: no method in request :'+request_str)
+            fail(str(number_line)+ ' ERROR: no method in request :'+request_str)
             return
         sample(time,json_obj,req_type,ip)
-        if "params" in json_obj and (json_obj["params"] == [] or json_obj["params"] == [None] or json_obj["params"] == None):
-            json_obj["params"] = [{}]
-            #print(number_line, 'amended request: ' + str(json_obj))
-        if not args.dry:
-            send_http_request(json.dumps(json_obj),2)
 
 network_map = {}
 def filter_network(line):
@@ -153,7 +204,7 @@ def filter_network(line):
     
 def check_interval(line,args):
     global last
-    res = re.search(r'(.*?) \(.+', line)
+    res = re.search(r'(.*?) \[.+', line)
     if res:
         cur_time = datetime.strptime(res.group(1), '%Y-%m-%d %H:%M:%S.%f')
         if last != None:
@@ -170,7 +221,7 @@ def fileter_sub(line):
     if 'Request processing duration' in line:
         #avoid process long request
         return
-    res = re.search(r'(.*) \(.+ws received request from work queue: ({.*}) ip = (.*)', line)
+    res = re.search(r'(.*) \[0x.+ws received request from work queue: ({.*}) ip = (.*)', line)
     if res:
         try:
             request_str = res.group(2)
@@ -180,11 +231,41 @@ def fileter_sub(line):
             print(number_line, 'ERROR: cannot parse json string :',request_str)
             return
         for key in ('command','method'):
-            for ty in ('accounts','books','accounts_proposed'):
+            for ty in ('accounts','books','accounts_proposed','streams'):
                 if key in json_obj and json_obj[key] == "subscribe":
                     subscriber_set.add(ip)
                     if ty in json_obj:
+                        if len(json_obj[ty])>10000:
+                            fail(res.group(1) +' WARNING: too many subscriptions: session id:'+res.group(2)+" accounts count: "+str(len(json_obj[ty])))
                         subscribe_map[ty] = subscribe_map.get(ty,0) + len(json_obj[ty])
+
+
+def send_requests(line,cmds):
+    if not 'received request from work queue' in line:
+        return
+    res = re.search(r'(\{.*\})', line)
+    if res:
+        request = res.group(1)
+        request_json = json.loads(request)
+        if not 'method' in request_json and 'command' not in request_json:
+            print('Invalid request', request_json)
+            return
+        if 'command' in request_json:
+            method = request_json.pop("command")
+            params = [request_json]
+            request_json = {"method":method,"params":params}
+        if cmds == None or request_json['method'] in cmds:
+            print("requests", line, '\n')
+            try:
+                conn = http.client.HTTPConnection(HOST, 51233)
+                conn.request("POST","/", body=json.dumps(request_json))
+                response = conn.getresponse()
+                response = response.read().decode('utf-8')
+                print("response",response)
+                time.sleep(0.5)
+            except OSError:
+                print("ERROR: connection refused, retrying")
+                time.sleep(1)
             
             
 #methods states
@@ -196,7 +277,7 @@ logfile = args.log_file
 start_line = args.start_line
 end_line = args.end_line
 
-with open(logfile) as f:
+with open(logfile,"r", encoding = "ISO-8859-1") as f:
     number_line = 0
     for line in f:
         number_line += 1
@@ -220,6 +301,12 @@ with open(logfile) as f:
             filter_network(line)
         if args.sub:
             fileter_sub(line)
+        if args.replay_http:
+            send_http_request(line)
+        if args.replay_ws:
+            send_ws_request(line)
+        if args.replay_all:
+            send_requests(line,args.cmds)
             
 if last:
     warning("From " + str(last) + " to end:")
